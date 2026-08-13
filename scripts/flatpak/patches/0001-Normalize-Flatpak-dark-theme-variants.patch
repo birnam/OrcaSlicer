@@ -1,0 +1,165 @@
+From: David Woods <birnam@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 15:20:00 -0400
+Subject: [PATCH] Detect legacy Flatpak dark themes
+
+The wxWidgets dependency already contains the desktop color-scheme portal
+integration originally authored by Paul Cornett and co-authored by Colin
+Kinloch. It was imported in SoftFever/Orca-deps-wxWidgets commit 139e4f2,
+referencing OrcaSlicer pull request 7283.
+
+Preserve its historical ORCA_SLICER_DARK_THEME behavior unchanged: any present
+value forces dark mode at startup, while an absent value follows desktop
+settings.
+
+Also read and monitor the legacy org.gnome.desktop.interface gtk-theme setting
+used by desktops without a color-scheme preference. Recognize any
+case-insensitive -dark suffix. When Flatpak lacks the advertised dark theme,
+select its base only if it supplies gtk-dark.css; when the desktop explicitly
+requests light, select the base only if it supplies gtk.css. Preserve
+GTK_THEME precedence and live system switching.
+---
+ src/gtk/settings.cpp | 127 ++++++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 111 insertions(+), 16 deletions(-)
+
+diff --git a/src/gtk/settings.cpp b/src/gtk/settings.cpp
+index f13ea2e..6c13a88 100644
+--- a/src/gtk/settings.cpp
++++ b/src/gtk/settings.cpp
+@@ -169,0 +170 @@ static wxColour gs_systemColorCache[wxSYS_COLOUR_MAX + 1];
++static guint32 gs_colorScheme;
+@@ -185,0 +187,29 @@ static void notify_gtk_font_name(GObject*, GParamSpec*, void*)
++static bool GtkThemeFileExists(const char* themeName, const char* fileName)
++{
++    const auto existsInDataDir = [themeName, fileName](const char* dataDir) {
++        gchar* path = g_build_filename(dataDir, "themes", themeName, "gtk-3.0", fileName, nullptr);
++        const bool exists = g_file_test(path, G_FILE_TEST_IS_REGULAR);
++        g_free(path);
++        return exists;
++    };
++
++    if (existsInDataDir(g_get_user_data_dir()))
++        return true;
++
++    for (const gchar* const* dataDirs = g_get_system_data_dirs(); *dataDirs; ++dataDirs)
++    {
++        if (existsInDataDir(*dataDirs))
++            return true;
++    }
++
++    return false;
++}
++
++static bool GtkThemeHasDarkSuffix(const char* themeName)
++{
++    constexpr size_t darkSuffixLength = 5;
++    const size_t themeNameLength = strlen(themeName);
++    return themeNameLength > darkSuffixLength &&
++        g_ascii_strcasecmp(themeName + themeNameLength - darkSuffixLength, "-dark") == 0;
++}
++
+@@ -189 +219 @@ static bool UpdatePreferDark(GVariant* value)
+-    gboolean preferDark = g_variant_get_uint32(value) == 1;
++    gs_colorScheme = g_variant_get_uint32(value);
+@@ -198,2 +228,27 @@ static bool UpdatePreferDark(GVariant* value)
+-    // We don't need to enable prefer-dark if the theme is already dark
+-    if (strstr(themeName, "-dark") || strstr(themeName, "-Dark"))
++    const bool themeRequestsDark = GtkThemeHasDarkSuffix(themeName);
++    gboolean preferDark = gs_colorScheme == 1 ||
++        (gs_colorScheme == 0 && themeRequestsDark);
++
++    // A Flatpak theme extension may expose a base theme with gtk-dark.css even
++    // when the host advertises its dark variant using a separate "-Dark" name.
++    // Select the base theme only when it provides the variant we need.
++    bool themeChanged = false;
++    constexpr size_t darkSuffixLength = 5;
++    const size_t themeNameLength = strlen(themeName);
++    if (themeRequestsDark)
++    {
++        gchar* baseThemeName = g_strndup(themeName, themeNameLength - darkSuffixLength);
++        const bool useBaseForLight = gs_colorScheme == 2 &&
++            GtkThemeFileExists(baseThemeName, "gtk.css");
++        const bool useBaseForDark = preferDark && !GtkThemeFileExists(themeName, "gtk.css") &&
++            GtkThemeFileExists(baseThemeName, "gtk-dark.css");
++        if (useBaseForLight || useBaseForDark)
++        {
++            g_object_set(settings, "gtk-theme-name", baseThemeName, nullptr);
++            themeChanged = true;
++        }
++        g_free(baseThemeName);
++    }
++
++    // An available dark theme already supplies its own dark appearance.
++    if (!themeChanged && themeRequestsDark)
+@@ -209 +264,31 @@ static bool UpdatePreferDark(GVariant* value)
+-    return changed;
++    return changed || themeChanged;
++}
++
++static bool UpdateGtkTheme(const char* themeName)
++{
++    GtkSettings* settings = gtk_settings_get_default();
++    char* previousThemeName;
++    g_object_get(settings, "gtk-theme-name", &previousThemeName, nullptr);
++
++    const bool changed = strcmp(themeName, previousThemeName) != 0;
++    g_free(previousThemeName);
++    if (changed)
++        g_object_set(settings, "gtk-theme-name", themeName, nullptr);
++
++    GVariant* value = g_variant_new_uint32(gs_colorScheme);
++    const bool darkChanged = UpdatePreferDark(value);
++    g_variant_unref(value);
++    return changed || darkChanged;
++}
++
++static void NotifyAppearanceChanged()
++{
++    for (int i = wxSYS_COLOUR_MAX; i--;)
++        gs_systemColorCache[i].UnRef();
++
++    for (auto* win: wxTopLevelWindows)
++    {
++        wxSysColourChangedEvent event;
++        event.SetEventObject(win);
++        win->HandleWindowEvent(event);
++    }
+@@ -223,0 +309 @@ proxy_g_signal(GDBusProxy*, const char*, const char* signal_name, GVariant* para
++    bool changed = false;
+@@ -227,12 +313 @@ proxy_g_signal(GDBusProxy*, const char*, const char* signal_name, GVariant* para
+-        if (UpdatePreferDark(value))
+-        {
+-            for (int i = wxSYS_COLOUR_MAX; i--;)
+-                gs_systemColorCache[i].UnRef();
+-
+-            for (auto* win: wxTopLevelWindows)
+-            {
+-                wxSysColourChangedEvent event;
+-                event.SetEventObject(win);
+-                win->HandleWindowEvent(event);
+-            }
+-        }
++        changed = UpdatePreferDark(value);
+@@ -239,0 +315,6 @@ proxy_g_signal(GDBusProxy*, const char*, const char* signal_name, GVariant* para
++    else if (strcmp(nameSpace, "org.gnome.desktop.interface") == 0 &&
++             strcmp(key, "gtk-theme") == 0)
++        changed = UpdateGtkTheme(g_variant_get_string(value, nullptr));
++
++    if (changed)
++        NotifyAppearanceChanged();
+@@ -1241,0 +1323,14 @@ bool wxSystemSettingsModule::OnInit()
++
++        ret = g_dbus_proxy_call_sync(m_proxy, "Read",
++            g_variant_new("(ss)", "org.gnome.desktop.interface", "gtk-theme"),
++            G_DBUS_CALL_FLAGS_NONE, -1, nullptr, nullptr);
++        if (ret)
++        {
++            GVariant* child;
++            g_variant_get(ret, "(v)", &child);
++            GVariant* value = g_variant_get_variant(child);
++            UpdateGtkTheme(g_variant_get_string(value, nullptr));
++            g_variant_unref(value);
++            g_variant_unref(child);
++            g_variant_unref(ret);
++        }
+--
+2.55.0

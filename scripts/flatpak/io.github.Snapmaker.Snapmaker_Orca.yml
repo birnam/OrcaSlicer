@@ -113,6 +113,12 @@ modules:
         url: https://github.com/SoftFever/Orca-deps-wxWidgets
         branch: master
         path: ../
+      - type: file
+        path: patches/0001-Normalize-Flatpak-dark-theme-variants.patch
+        dest-filename: wxwidgets-flatpak-dark-themes.patch
+      - type: shell
+        commands:
+          - git apply --unidiff-zero wxwidgets-flatpak-dark-themes.patch
     cleanup:
       - "*.la"
       - "*.a"
